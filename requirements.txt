@@ -1,0 +1,6 @@
+kurigram
+tgcrypto
+aiohttp
+pytz
+Pillow
+img2pdf
