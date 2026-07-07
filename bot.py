@@ -6,9 +6,12 @@ import time
 import uuid
 
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InputMediaPhoto
 
-from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS, DOWNLOAD_DIR, MAX_FILE_SIZE
+from config import (
+    API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS, DOWNLOAD_DIR, MAX_FILE_SIZE,
+    START_PIC, LOG_CHANNEL, DOWNLOAD_IMAGE, PROCESS_IMAGE, UPLOAD_IMAGE,
+)
 from webserver import run_webserver
 from converter import convert_to_pdf, ConversionError
 
@@ -62,41 +65,151 @@ def _document_ext(message: Message):
     return ext if ext in SUPPORTED_EXTS else None
 
 
-class Throttled:
-    """Small helper to avoid hitting FloodWait by editing a status message too often."""
+# ----------------------------------------------------------------------------
+# Fancy status box rendering
+# ----------------------------------------------------------------------------
 
-    def __init__(self, message: Message, interval: float = 4.0):
-        self.message = message
+def _progress_bar(percent: float, length: int = 10) -> str:
+    filled = int(length * percent / 100)
+    filled = max(0, min(length, filled))
+    return "■" * filled + "□" * (length - filled)
+
+
+def _format_speed(bytes_per_sec: float) -> str:
+    if bytes_per_sec <= 0:
+        return "0B/s"
+    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+        if bytes_per_sec < 1024:
+            return f"{bytes_per_sec:.1f}{unit}"
+        bytes_per_sec /= 1024
+    return f"{bytes_per_sec:.1f}TB/s"
+
+
+def _format_eta(seconds) -> str:
+    if seconds is None or seconds == float("inf") or seconds < 0:
+        return "Calculating..."
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} Seconds"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _build_progress_box(stage_icon: str, stage_label: str, percent: float, speed_text: str, eta_text: str) -> str:
+    bar = _progress_bar(percent)
+    return (
+        "<b>╭────────────────────╮\n"
+        "│ 📄 CBZ → PDF       │\n"
+        "├────────────────────┤\n"
+        f"│{stage_icon} {stage_label}...\n"
+        "├────────────────────┤\n"
+        f"│ Progress │ {percent:.0f}%\n"
+        "├────────────────────┤\n"
+        f"│ [{bar}]\n"
+        "├────────────────────┤\n"
+        f"│ Speed: {speed_text}\n"
+        "├────────────────────┤\n"
+        f"│ ETA • {eta_text}\n"
+        "╰────────────────────╯</b>"
+    )
+
+
+def _build_static_box(stage_icon: str, stage_label: str) -> str:
+    return (
+        "<b>╭────────────────────╮\n"
+        "│ 📄 CBZ → PDF       │\n"
+        "├────────────────────┤\n"
+        f"│{stage_icon} {stage_label}...\n"
+        "╰────────────────────╯</b>"
+    )
+
+
+class StatusBox:
+    """
+    Wraps a single status message and lets it be updated in place, throttled
+    to avoid FloodWait. Transparently switches between a plain text message
+    and a photo-with-caption message depending on whether a stage image is
+    supplied, since Telegram can't turn one into the other via a simple edit.
+    """
+
+    def __init__(self, client: Client, chat_id: int, interval: float = 4.0):
+        self.client = client
+        self.chat_id = chat_id
         self.interval = interval
-        self._last = 0.0
+        self.message: Message = None
+        self._last_edit = 0.0
 
-    async def update(self, text: str, force: bool = False):
+    async def send(self, text: str, image: str = None):
+        if image:
+            try:
+                self.message = await self.client.send_photo(self.chat_id, photo=image, caption=text)
+                return
+            except Exception:
+                logger.warning("Failed to send status image, falling back to text", exc_info=True)
+        self.message = await self.client.send_message(self.chat_id, text)
+
+    async def update(self, text: str, image: str = None, force: bool = False):
         now = time.monotonic()
-        if not force and (now - self._last) < self.interval:
+        if not force and (now - self._last_edit) < self.interval:
             return
-        self._last = now
+        self._last_edit = now
+
+        has_photo = bool(self.message.photo)
         try:
-            await self.message.edit_text(text)
+            if image and has_photo:
+                await self.message.edit_media(InputMediaPhoto(media=image, caption=text))
+            elif image and not has_photo:
+                await self.message.delete()
+                self.message = await self.client.send_photo(self.chat_id, photo=image, caption=text)
+            elif not image and has_photo:
+                await self.message.edit_caption(text)
+            else:
+                await self.message.edit_text(text)
+        except Exception:
+            pass
+
+    async def delete(self):
+        try:
+            await self.message.delete()
         except Exception:
             pass
 
 
-def _progress_factory(throttled: Throttled, verb: str):
+def _progress_factory(status: StatusBox, stage_icon: str, stage_label: str, image: str):
+    start_time = time.monotonic()
+
     async def progress(current: int, total: int):
-        if total:
-            pct = current * 100 / total
-            await throttled.update(
-                f"{verb}... {pct:.1f}% ({current // 1024 // 1024}MB / {total // 1024 // 1024}MB)"
-            )
+        if not total:
+            return
+        elapsed = time.monotonic() - start_time
+        percent = current * 100 / total
+        speed = current / elapsed if elapsed > 0 else 0
+        remaining_bytes = total - current
+        eta = (remaining_bytes / speed) if speed > 0 else None
+        text = _build_progress_box(stage_icon, stage_label, percent, _format_speed(speed), _format_eta(eta))
+        await status.update(text, image=image)
+
     return progress
 
+
+# ----------------------------------------------------------------------------
+# Handlers
+# ----------------------------------------------------------------------------
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     if message.from_user and message.from_user.id in ADMIN_IDS:
-        await message.reply(
-            "Hi! Send me a **.cbz** or **.cbr** file and I'll convert it to a PDF for you."
-        )
+        text = "Hi! Send me a **.cbz** or **.cbr** file and I'll convert it to a PDF for you."
+        if START_PIC:
+            try:
+                await message.reply_photo(START_PIC, caption=text)
+                return
+            except Exception:
+                logger.warning("Failed to send start pic, falling back to text", exc_info=True)
+        await message.reply(text)
     else:
         await message.reply("This bot is private and restricted to its admins only.")
 
@@ -118,8 +231,11 @@ async def comic_handler(client: Client, message: Message):
         )
         return
 
-    status = await message.reply("Starting download...")
-    throttled = Throttled(status)
+    status = StatusBox(client, message.chat.id)
+    await status.send(
+        _build_progress_box("⚙️", "Downloading", 0, "0B/s", "Calculating..."),
+        image=DOWNLOAD_IMAGE,
+    )
 
     task_dir = os.path.join(DOWNLOAD_DIR, uuid.uuid4().hex)
     os.makedirs(task_dir, exist_ok=True)
@@ -132,10 +248,14 @@ async def comic_handler(client: Client, message: Message):
         await client.download_media(
             message,
             file_name=archive_path,
-            progress=_progress_factory(throttled, "Downloading"),
+            progress=_progress_factory(status, "⚙️", "Downloading", DOWNLOAD_IMAGE),
         )
 
-        await throttled.update("Converting to PDF... this can take a while for large comics.", force=True)
+        await status.update(
+            _build_static_box("🖨", "Processing"),
+            image=PROCESS_IMAGE,
+            force=True,
+        )
 
         async with CONVERSION_LOCK:
             await asyncio.to_thread(
@@ -146,24 +266,45 @@ async def comic_handler(client: Client, message: Message):
                 ext == ".cbr",
             )
 
-        await throttled.update("Uploading PDF...", force=True)
+        await status.update(
+            _build_progress_box("⚙️", "Uploading", 0, "0B/s", "Calculating..."),
+            image=UPLOAD_IMAGE,
+            force=True,
+        )
 
         await client.send_document(
             chat_id=message.chat.id,
             document=pdf_path,
             file_name=f"{base_name}.pdf",
             caption=f"Here's your converted PDF: **{base_name}.pdf**",
-            progress=_progress_factory(throttled, "Uploading"),
+            progress=_progress_factory(status, "⚙️", "Uploading", UPLOAD_IMAGE),
         )
+
+        if LOG_CHANNEL:
+            try:
+                await client.send_document(
+                    LOG_CHANNEL,
+                    archive_path,
+                    file_name=f"{base_name}{ext}",
+                    caption=f"📥 Source file from {message.from_user.mention}",
+                )
+                await client.send_document(
+                    LOG_CHANNEL,
+                    pdf_path,
+                    file_name=f"{base_name}.pdf",
+                    caption=f"📤 Converted PDF for {message.from_user.mention}",
+                )
+            except Exception:
+                logger.warning("Failed to forward files to LOG_CHANNEL", exc_info=True)
 
         await status.delete()
 
     except ConversionError as e:
         logger.warning(f"Conversion failed for {message.document.file_name}: {e}")
-        await throttled.update(f"❌ Conversion failed: {e}", force=True)
+        await status.update(f"❌ Conversion failed: {e}", force=True)
     except Exception:
         logger.exception(f"Unexpected error converting {message.document.file_name}")
-        await throttled.update("❌ Something went wrong while processing that file.", force=True)
+        await status.update("❌ Something went wrong while processing that file.", force=True)
     finally:
         shutil.rmtree(task_dir, ignore_errors=True)
 
