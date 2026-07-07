@@ -105,7 +105,7 @@ def _format_eta(seconds) -> str:
 def _build_progress_box(stage_icon: str, stage_label: str, percent: float, speed_text: str, eta_text: str) -> str:
     bar = _progress_bar(percent)
     return (
-        "<b>╭────────────────────╮\n"
+        "<blockquote><b>╭────────────────────╮\n"
         "│ 📄 CBZ → PDF       │\n"
         "├────────────────────┤\n"
         f"│{stage_icon} {stage_label}...\n"
@@ -117,17 +117,17 @@ def _build_progress_box(stage_icon: str, stage_label: str, percent: float, speed
         f"│ Speed: {speed_text}\n"
         "├────────────────────┤\n"
         f"│ ETA • {eta_text}\n"
-        "╰────────────────────╯</b>"
+        "╰────────────────────╯</b></blockquote>"
     )
 
 
 def _build_static_box(stage_icon: str, stage_label: str) -> str:
     return (
-        "<b>╭────────────────────╮\n"
+        "<blockquote><b>╭────────────────────╮\n"
         "│ 📄 CBZ → PDF       │\n"
         "├────────────────────┤\n"
         f"│{stage_icon} {stage_label}...\n"
-        "╰────────────────────╯</b>"
+        "╰────────────────────╯</b></blockquote>"
     )
 
 
@@ -206,7 +206,7 @@ def _progress_factory(status: StatusBox, stage_icon: str, stage_label: str, imag
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     if message.from_user and message.from_user.id in ADMIN_IDS:
-        text = "Welcome to the **CBZ to PDF Converter**! 📚➡️📄 Simply send me your CBZ files, and I will quickly transform them into high-quality PDFs for you. ✨ Let's get started! 🚀"
+        text = "<blockquote>Welcome to the **CBZ to PDF Converter**! 📚➡️📄 Simply send me your CBZ files, and I will quickly transform them into high-quality PDFs for you. ✨ Let's get started! 🚀</blockquote>"
         if START_PIC:
             try:
                 await message.reply_photo(START_PIC, caption=text)
