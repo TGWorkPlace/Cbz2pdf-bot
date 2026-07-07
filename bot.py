@@ -14,6 +14,10 @@ from config import (
 )
 from webserver import run_webserver
 from converter import convert_to_pdf, ConversionError
+from pyrogram import utils as pyroutils
+
+pyroutils.MIN_CHAT_ID = -999999999999
+pyroutils.MIN_CHANNEL_ID = -100999999999999
 
 logging.basicConfig(
     level=logging.INFO,
