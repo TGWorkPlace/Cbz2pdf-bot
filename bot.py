@@ -202,7 +202,7 @@ def _progress_factory(status: StatusBox, stage_icon: str, stage_label: str, imag
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
     if message.from_user and message.from_user.id in ADMIN_IDS:
-        text = "Hi! Send me a **.cbz** or **.cbr** file and I'll convert it to a PDF for you."
+        text = "Welcome to the **CBZ to PDF Converter**! 📚➡️📄 Simply send me your CBZ files, and I will quickly transform them into high-quality PDFs for you. ✨ Let's get started! 🚀"
         if START_PIC:
             try:
                 await message.reply_photo(START_PIC, caption=text)
