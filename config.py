@@ -35,3 +35,13 @@ LOG_CHANNEL = int(_log_channel_raw) if _log_channel_raw.lstrip("-").isdigit() el
 DOWNLOAD_IMAGE = os.environ.get("DOWNLOAD_IMAGE", "https://imghost-bay.vercel.app/i/BQACAgUAAyEGAATP5GC2AAOiak0JwPtVEntOK7KfXLlHmw-hyNsAAjsmAAIpuGlWI33b1rOXd148BA").strip() or None
 PROCESS_IMAGE = os.environ.get("PROCESS_IMAGE", "https://imghost-bay.vercel.app/i/BQACAgUAAyEGAATP5GC2AAOjak0J5fHUGw6XTYWUWYxWHcX_9lwAAjwmAAIpuGlWSkNw9_Bjj1g8BA").strip() or None
 UPLOAD_IMAGE = os.environ.get("UPLOAD_IMAGE", "https://imghost-bay.vercel.app/i/BQACAgUAAyEGAATP5GC2AAOkak0KDdUVrERQHJ8aMHaLvKv6zX4AAj0mAAIpuGlWIAJVN2a02D48BA").strip() or None
+
+# MongoDB connection string used to persist SUDO users + their bandwidth
+# quota so they survive bot restarts. Leave empty to disable SUDO support.
+MONGO_URI = os.environ.get("MONGO_URI", "").strip()
+
+# Name of the MongoDB database used for SUDO user storage.
+DATABASE_NAME = os.environ.get("DATABASE_NAME", "cbz2pdf_bot").strip()
+
+# Monthly bandwidth quota (in bytes) granted to each SUDO user. Default: 5 GB.
+SUDO_MONTHLY_LIMIT_BYTES = int(os.environ.get("SUDO_MONTHLY_LIMIT_BYTES", 5 * 1024 * 1024 * 1024))
