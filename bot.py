@@ -484,13 +484,14 @@ async def stats_handler(client: Client, message: Message):
     billing_month = datetime.strptime(doc["current_month"], "%Y-%m").strftime("%B %Y")
 
     text = (
-        f"User ID: {doc['user_id']}\n"
-        f"Monthly Limit: {_format_gb(limit)}\n"
-        f"Used: {_format_gb(used)}\n"
-        f"Remaining: {_format_gb(remaining)}\n"
-        f"Usage: {percent:.1f}%\n"
-        f"Last Used: {last_used_text}\n"
-        f"Billing Month: {billing_month}"
+        f"📊 SUDO User Usage\n"
+        f"👤 User ID: {doc['user_id']}\n"
+        f"📅 Monthly Limit: {_format_gb(limit)}\n"
+        f"📈 Used: {_format_gb(used)}\n"
+        f"🟢 Remaining: {_format_gb(remaining)}\n"
+        f"📶 Usage: {percent:.1f}%\n"
+        f"🕒 Last Used: {last_used_text}\n"
+        f"🗓️ Billing Month: {billing_month}"
     )
     await message.reply(text)
 
