@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 import uuid
+from datetime import datetime
 
 from pyrogram import Client, filters
 from pyrogram.types import Message, InputMediaPhoto
@@ -11,9 +12,11 @@ from pyrogram.types import Message, InputMediaPhoto
 from config import (
     API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS, DOWNLOAD_DIR, MAX_FILE_SIZE,
     START_PIC, LOG_CHANNEL, DOWNLOAD_IMAGE, PROCESS_IMAGE, UPLOAD_IMAGE,
+    SUDO_MONTHLY_LIMIT_BYTES,
 )
 from webserver import run_webserver
 from converter import convert_to_pdf, ConversionError
+import database as db
 from pyrogram import utils as pyroutils
 
 pyroutils.MIN_CHAT_ID = -999999999999
@@ -31,7 +34,39 @@ CONVERSION_LOCK = asyncio.Semaphore(1)
 
 SUPPORTED_EXTS = (".cbz", ".cbr")
 
+# In-memory cache of SUDO user ids, warmed from MongoDB on startup and kept
+# in sync whenever /add_sudo or /del_sudo runs, so permission checks stay
+# fast and synchronous like the existing ADMIN_IDS check.
+SUDO_IDS_CACHE = set()
+
+# How often (in seconds) to check whether the billing month has rolled over,
+# so quotas reset automatically even if the bot keeps running across the
+# month boundary without a restart.
+MONTHLY_RESET_CHECK_INTERVAL = 3600
+
+
+def _is_authorized(user_id: int) -> bool:
+    return user_id in ADMIN_IDS or user_id in SUDO_IDS_CACHE
+
+
+def _format_gb(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 ** 3):.2f} GB"
+
+
+async def _monthly_reset_scheduler():
+    """Background task: periodically resets SUDO quotas when a new month starts."""
+    while True:
+        try:
+            await asyncio.sleep(MONTHLY_RESET_CHECK_INTERVAL)
+            await db.reset_all_if_new_month()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("Error while checking for monthly SUDO quota reset")
+
+
 admin_filter = filters.create(lambda _, __, m: bool(m.from_user) and m.from_user.id in ADMIN_IDS)
+auth_filter = filters.create(lambda _, __, m: bool(m.from_user) and _is_authorized(m.from_user.id))
 
 
 class ComicToPdfBot(Client):
@@ -51,7 +86,22 @@ class ComicToPdfBot(Client):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         self._web_runner = await run_webserver()
 
+        db.init_db()
+        try:
+            # Catch up on any monthly reset that was missed while offline,
+            # then warm the in-memory SUDO cache from persistent storage.
+            await db.reset_all_if_new_month()
+            sudo_ids = await db.get_all_sudo_ids()
+            SUDO_IDS_CACHE.update(sudo_ids)
+            logger.info(f"Loaded {len(sudo_ids)} SUDO user(s) from the database.")
+        except Exception:
+            logger.exception("Failed to load SUDO users from the database.")
+
+        self._reset_scheduler_task = asyncio.create_task(_monthly_reset_scheduler())
+
     async def stop(self, *args, **kwargs):
+        if hasattr(self, "_reset_scheduler_task"):
+            self._reset_scheduler_task.cancel()
         if hasattr(self, "_web_runner"):
             await self._web_runner.cleanup()
         await super().stop(*args, **kwargs)
@@ -205,7 +255,7 @@ def _progress_factory(status: StatusBox, stage_icon: str, stage_label: str, imag
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
-    if message.from_user and message.from_user.id in ADMIN_IDS:
+    if message.from_user and _is_authorized(message.from_user.id):
         text = "<blockquote>Welcome to the **CBZ to PDF Converter**! 📚➡️📄 Simply send me your CBZ files, and I will quickly transform them into high-quality PDFs for you. ✨ Let's get started! 🚀</blockquote>"
         if START_PIC:
             try:
@@ -220,9 +270,12 @@ async def start_handler(client: Client, message: Message):
 
 @app.on_message(filters.private & filters.document & ~filters.command("start"))
 async def comic_handler(client: Client, message: Message):
-    if not (message.from_user and message.from_user.id in ADMIN_IDS):
+    if not (message.from_user and _is_authorized(message.from_user.id)):
         await message.reply("Sorry, this bot is admins-only.")
         return
+
+    user_id = message.from_user.id
+    is_admin_user = user_id in ADMIN_IDS
 
     ext = _document_ext(message)
     if ext is None:
@@ -234,6 +287,18 @@ async def comic_handler(client: Client, message: Message):
             f"That file is too large. Max supported size is {MAX_FILE_SIZE // 1024 // 1024}MB."
         )
         return
+
+    if not is_admin_user:
+        try:
+            if not await db.has_quota(user_id):
+                await message.reply(
+                    "❌ You've reached your monthly bandwidth quota "
+                    f"({_format_gb(SUDO_MONTHLY_LIMIT_BYTES)}). "
+                    "It will automatically reset at the start of next month."
+                )
+                return
+        except Exception:
+            logger.exception("Failed to check SUDO quota for user %s; allowing request to proceed.", user_id)
 
     status = StatusBox(client, message.chat.id)
     await status.send(
@@ -284,6 +349,16 @@ async def comic_handler(client: Client, message: Message):
             progress=_progress_factory(status, "⚙️", "Uploading", UPLOAD_IMAGE),
         )
 
+        downloaded_bytes = message.document.file_size or 0
+        try:
+            uploaded_bytes = os.path.getsize(pdf_path)
+        except OSError:
+            uploaded_bytes = 0
+        try:
+            await db.add_usage(user_id, downloaded_bytes + uploaded_bytes)
+        except Exception:
+            logger.exception("Failed to record bandwidth usage for user %s", user_id)
+
         if LOG_CHANNEL:
             try:
                 await client.send_document(
@@ -311,6 +386,113 @@ async def comic_handler(client: Client, message: Message):
         await status.update("❌ Something went wrong while processing that file.", force=True)
     finally:
         shutil.rmtree(task_dir, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------------
+# SUDO user management + quota stats
+# ----------------------------------------------------------------------------
+
+@app.on_message(filters.command("add_sudo") & admin_filter)
+async def add_sudo_handler(client: Client, message: Message):
+    if len(message.command) < 2 or not message.command[1].strip().lstrip("-").isdigit():
+        await message.reply("Usage: `/add_sudo <user_id>`")
+        return
+
+    user_id = int(message.command[1].strip())
+    try:
+        added = await db.add_sudo_user(user_id)
+    except RuntimeError as e:
+        await message.reply(f"❌ {e}")
+        return
+    except Exception:
+        logger.exception("Failed to add SUDO user %s", user_id)
+        await message.reply("❌ Something went wrong while adding that SUDO user.")
+        return
+
+    if added:
+        SUDO_IDS_CACHE.add(user_id)
+        await message.reply(
+            f"✅ User `{user_id}` has been added as a SUDO user with a "
+            f"{_format_gb(SUDO_MONTHLY_LIMIT_BYTES)} monthly bandwidth quota."
+        )
+    else:
+        await message.reply(f"User `{user_id}` is already a SUDO user.")
+
+
+@app.on_message(filters.command("del_sudo") & admin_filter)
+async def del_sudo_handler(client: Client, message: Message):
+    if len(message.command) < 2 or not message.command[1].strip().lstrip("-").isdigit():
+        await message.reply("Usage: `/del_sudo <user_id>`")
+        return
+
+    user_id = int(message.command[1].strip())
+    try:
+        removed = await db.remove_sudo_user(user_id)
+    except RuntimeError as e:
+        await message.reply(f"❌ {e}")
+        return
+    except Exception:
+        logger.exception("Failed to remove SUDO user %s", user_id)
+        await message.reply("❌ Something went wrong while removing that SUDO user.")
+        return
+
+    if removed:
+        SUDO_IDS_CACHE.discard(user_id)
+        await message.reply(f"✅ User `{user_id}` has been removed from SUDO users.")
+    else:
+        await message.reply(f"User `{user_id}` was not found in the SUDO users list.")
+
+
+@app.on_message(filters.command("stats") & filters.private)
+async def stats_handler(client: Client, message: Message):
+    if not message.from_user:
+        return
+
+    requester_id = message.from_user.id
+    is_admin_user = requester_id in ADMIN_IDS
+    is_sudo_user = requester_id in SUDO_IDS_CACHE
+
+    if not (is_admin_user or is_sudo_user):
+        await message.reply("Sorry, this bot is admins-only.")
+        return
+
+    # Admins may check any SUDO user's stats via /stats <user_id>.
+    target_id = requester_id
+    if is_admin_user and len(message.command) > 1 and message.command[1].strip().lstrip("-").isdigit():
+        target_id = int(message.command[1].strip())
+
+    try:
+        doc = await db.get_sudo_doc(target_id)
+    except Exception:
+        logger.exception("Failed to fetch SUDO stats for user %s", target_id)
+        await message.reply("❌ Something went wrong while fetching quota stats.")
+        return
+
+    if doc is None:
+        if target_id == requester_id:
+            await message.reply("You have unlimited admin access; no bandwidth quota is tracked for you.")
+        else:
+            await message.reply(f"No SUDO quota record found for user `{target_id}`.")
+        return
+
+    limit = doc.get("monthly_limit_bytes", SUDO_MONTHLY_LIMIT_BYTES)
+    used = doc.get("used_bytes", 0)
+    remaining = max(limit - used, 0)
+    percent = (used / limit * 100) if limit else 0.0
+    last_used = doc.get("last_used_date")
+    last_used_text = last_used.strftime("%Y-%m-%d %H:%M UTC") if last_used else "Never"
+    billing_month = datetime.strptime(doc["current_month"], "%Y-%m").strftime("%B %Y")
+
+    text = (
+        f"User ID: {doc['user_id']}\n"
+        f"Monthly Limit: {_format_gb(limit)}\n"
+        f"Used: {_format_gb(used)}\n"
+        f"Remaining: {_format_gb(remaining)}\n"
+        f"Usage: {percent:.1f}%\n"
+        f"Last Used: {last_used_text}\n"
+        f"Billing Month: {billing_month}"
+    )
+    await message.reply(text)
 
 
 if __name__ == "__main__":
